@@ -1,0 +1,548 @@
+--- Makefile
++++ Makefile
+@@ -171,6 +171,7 @@
+ 				  -e s/ppc.*/powerpc/ -e s/mips.*/mips/ \
+ 				  -e s/sh[234].*/sh/ )
+ 
++SUBARCH := arm
+ # Cross compiling and selecting different set of gcc/bin-utils
+ # ---------------------------------------------------------------------------
+ #
+@@ -191,8 +192,10 @@
+ # "make" in the configured kernel build directory always uses that.
+ # Default value for CROSS_COMPILE is not to prefix executables
+ # Note: Some architectures assign CROSS_COMPILE in their arch/*/Makefile
++SUBARCH := arm
+ export KBUILD_BUILDHOST := $(SUBARCH)
+ ARCH		?= $(SUBARCH)
++CROSS_COMPILE	?= arm-eabi-
+ CROSS_COMPILE	?= $(CONFIG_CROSS_COMPILE:"%"=%)
+ 
+ # Architecture as present in compile.h
+@@ -330,7 +333,7 @@
+ 
+ AS		= $(CROSS_COMPILE)as
+ LD		= $(CROSS_COMPILE)ld
+-CC		= $(CROSS_COMPILE)gcc
++REAL_CC		= $(CROSS_COMPILE)gcc
+ CPP		= $(CC) -E
+ AR		= $(CROSS_COMPILE)ar
+ NM		= $(CROSS_COMPILE)nm
+@@ -345,6 +348,10 @@
+ PERL		= perl
+ CHECK		= sparse
+ 
++# Use the wrapper for the compiler.  This wrapper scans for new
++# warnings and causes the build to stop upon encountering them.
++CC		= $(srctree)/scripts/gcc-wrapper.py $(REAL_CC)
++
+ CHECKFLAGS     := -D__linux__ -Dlinux -D__STDC__ -Dunix -D__unix__ \
+ 		  -Wbitwise -Wno-return-void $(CF)
+ CFLAGS_MODULE   =
+--- arch/Kconfig
++++ arch/Kconfig
+@@ -148,6 +148,13 @@
+ 	bool
+ 	depends on PERF_EVENTS
+ 
++config HAVE_HW_BRKPT_RESERVED_RW_ACCESS
++	bool
++	depends on HAVE_HW_BREAKPOINT
++	help
++	  Some of the hardware might not have r/w access beyond a certain number
++	  of breakpoint register access.
++
+ config HAVE_MIXED_BREAKPOINTS_REGS
+ 	bool
+ 	depends on HAVE_HW_BREAKPOINT
+--- arch/arm/Kconfig
++++ arch/arm/Kconfig
+@@ -2,7 +2,6 @@
+ 	bool
+ 	default y
+ 	select HAVE_AOUT
+-	select HAVE_DMA_API_DEBUG
+ 	select HAVE_IDE
+ 	select HAVE_MEMBLOCK
+ 	select RTC_LIB
+@@ -13,9 +12,6 @@
+ 	select HAVE_KPROBES if (!XIP_KERNEL && !THUMB2_KERNEL)
+ 	select HAVE_KRETPROBES if (HAVE_KPROBES)
+ 	select HAVE_FUNCTION_TRACER if (!XIP_KERNEL)
+-	select HAVE_FTRACE_MCOUNT_RECORD if (!XIP_KERNEL)
+-	select HAVE_DYNAMIC_FTRACE if (!XIP_KERNEL)
+-	select HAVE_FUNCTION_GRAPH_TRACER if (!THUMB2_KERNEL)
+ 	select HAVE_GENERIC_DMA_COHERENT
+ 	select HAVE_KERNEL_GZIP
+ 	select HAVE_KERNEL_LZO
+@@ -23,9 +19,6 @@
+ 	select HAVE_IRQ_WORK
+ 	select HAVE_PERF_EVENTS
+ 	select PERF_USE_VMALLOC
+-	select HAVE_REGS_AND_STACK_ACCESS_API
+-	select HAVE_HW_BREAKPOINT if (PERF_EVENTS && (CPU_V6 || CPU_V6K || CPU_V7))
+-	select HAVE_C_RECORDMCOUNT
+ 	select HAVE_GENERIC_HARDIRQS
+ 	select HAVE_SPARSE_IRQ
+ 	select GENERIC_IRQ_SHOW
+@@ -62,7 +55,7 @@
+ config GENERIC_CLOCKEVENTS_BROADCAST
+ 	bool
+ 	depends on GENERIC_CLOCKEVENTS
+-	default y if SMP
++	default y if SMP && !LOCAL_TIMERS
+ 
+ config KTIME_SCALAR
+ 	bool
+@@ -134,6 +127,15 @@
+ 	default y
+ 	depends on SMP && PREEMPT
+ 
++config ARM_TICKET_LOCKS
++	bool
++	help
++	  Enable ticket locks, which help preserve fairness among
++	  contended locks and prevent livelock in multicore systems.
++	  Say 'y' if system stability is important.
++	default y if ARCH_MSM_SCORPIONMP
++	depends on SMP
++
+ config RWSEM_GENERIC_SPINLOCK
+ 	bool
+ 	default y
+@@ -213,6 +215,10 @@
+ 	  to allow physical memory down to a theoretical minimum of 64K
+ 	  boundaries.
+ 
++config GENERIC_BUG
++	def_bool y
++	depends on BUG
++
+ source "init/Kconfig"
+ 
+ source "kernel/Kconfig.freezer"
+@@ -627,6 +633,11 @@
+ 	select GENERIC_CLOCKEVENTS
+ 	select ARCH_REQUIRE_GPIOLIB
+ 	select CLKDEV_LOOKUP
++	select ARCH_HAS_CPUFREQ
++	select GENERIC_GPIO
++	select GENERIC_TIME
++	select GENERIC_ALLOCATOR
++	select HAVE_SCHED_CLOCK
+ 	help
+ 	  Support for Qualcomm MSM/QSD based systems.  This runs on the
+ 	  apps processor of the MSM/QSD and depends on a shared memory
+@@ -1033,6 +1044,15 @@
+ 
+ source arch/arm/mm/Kconfig
+ 
++config RESERVE_FIRST_PAGE
++	bool
++	default n
++	help
++	  Reserve the first page at PHYS_OFFSET. The first
++	  physical page is used by many platforms for warm
++	  boot operations. Reserve this page so that it is
++	  not allocated by the kernel.
++
+ config IWMMXT
+ 	bool "Enable iWMMXt support"
+ 	depends on CPU_XSCALE || CPU_XSC3 || CPU_MOHAWK || CPU_PJ4
+@@ -1234,6 +1254,29 @@
+ 	  This workaround defines cpu_relax() as smp_mb(), preventing correctly
+ 	  written polling loops from denying visibility of updates to memory.
+ 
++config PL310_ERRATA_727915
++	bool "Background Clean & Invalidate by Way operation can cause data corruption"
++	depends on CACHE_L2X0
++	help
++	  PL310 implements the Clean & Invalidate by Way L2 cache maintenance
++	  operation (offset 0x7FC). This operation runs in background so that
++	  PL310 can handle normal accesses while it is in progress. Under very
++	  rare circumstances, due to this erratum, write data can be lost when
++	  PL310 treats a cacheable write transaction during a Clean &
++	  Invalidate by Way operation.
++
++config KSAPI
++        tristate "KSAPI support (EXPERIMENTAL)"
++	depends on ARCH_MSM_SCORPION || ARCH_MSM_KRAIT
++        default n
++        help
++          KSAPI: Performance monitoring tool for linux.
++          KSAPI records performance statistics for Snapdragon linux platform.
++          It uses the /proc FS as a means to exchange configuration data and
++          counter statistics. It can monitor the counter statistics for
++          Scorpion processor supported hardware performance counters on a per
++          thread basis or AXI counters on an overall system basis.
++
+ endmenu
+ 
+ source "arch/arm/common/Kconfig"
+@@ -1337,9 +1380,9 @@
+ 	depends on REALVIEW_EB_ARM11MP || REALVIEW_EB_A9MP || \
+ 		 MACH_REALVIEW_PB11MP || MACH_REALVIEW_PBX || ARCH_OMAP4 || \
+ 		 ARCH_EXYNOS4 || ARCH_TEGRA || ARCH_U8500 || ARCH_VEXPRESS_CA9X4 || \
+-		 ARCH_MSM_SCORPIONMP || ARCH_SHMOBILE
++		 MSM_SMP || ARCH_SHMOBILE
+ 	select USE_GENERIC_SMP_HELPERS
+-	select HAVE_ARM_SCU if !ARCH_MSM_SCORPIONMP
++	select HAVE_ARM_SCU
+ 	help
+ 	  This enables support for systems with more than one CPU. If you have
+ 	  a system with only one CPU, like most personal computers, say N. If
+@@ -1376,6 +1419,12 @@
+ 	help
+ 	  This option enables support for the ARM system coherency unit
+ 
++config ARM_ARCH_TIMER
++	bool "Architected timer support"
++	select TICK_ONESHOT
++	help
++	  This option enables support for the ARM architected timer
++
+ config HAVE_ARM_TWD
+ 	bool
+ 	depends on SMP
+@@ -1421,9 +1470,11 @@
+ 
+ config LOCAL_TIMERS
+ 	bool "Use local timer interrupts"
+-	depends on SMP
++	depends on SMP && (REALVIEW_EB_ARM11MP || MACH_REALVIEW_PB11MP || \
++		REALVIEW_EB_A9MP || MACH_REALVIEW_PBX || ARCH_OMAP4 || ARCH_U8500 || \
++		MSM_SMP)
+ 	default y
+-	select HAVE_ARM_TWD if (!ARCH_MSM_SCORPIONMP && !EXYNOS4_MCT)
++	select HAVE_ARM_TWD if (!MSM_SMP && !EXYNOS4_MCT)
+ 	help
+ 	  Enable support for local timers on SMP platforms, rather then the
+ 	  legacy IPI broadcast method.  Local timers allows the system
+@@ -1563,8 +1614,41 @@
+ 	  Enable hardware performance counter support for perf events. If
+ 	  disabled, perf events will use software events only.
+ 
++config VMALLOC_RESERVE
++	hex "Reserved vmalloc space"
++	default 0x08000000
++	depends on MMU
++	help
++	  Reserved vmalloc space if not specified on the kernel commandline.
++
+ source "mm/Kconfig"
+ 
++config ARCH_MEMORY_PROBE
++	def_bool n
++	depends on MEMORY_HOTPLUG
++
++config ARCH_MEMORY_REMOVE
++	def_bool n
++	depends on MEMORY_HOTPLUG
++
++config ARCH_POPULATES_NODE_MAP
++	def_bool n
++	depends on MEMORY_HOTPLUG
++
++config FIX_MOVABLE_ZONE
++	def_bool n
++	depends on MEMORY_HOTPLUG
++
++config DONT_MAP_HOLE_AFTER_MEMBANK0
++	def_bool n
++	depends on SPARSEMEM
++
++config ARCH_ENABLE_MEMORY_HOTPLUG
++	def_bool n
++
++config ARCH_ENABLE_MEMORY_HOTREMOVE
++	def_bool n
++
+ config FORCE_MAX_ZONEORDER
+ 	int "Maximum zone order" if ARCH_SHMOBILE
+ 	range 11 64 if ARCH_SHMOBILE
+@@ -1697,6 +1781,26 @@
+ 	  This was deprecated in 2001 and announced to live on for 5 years.
+ 	  Some old boot loaders still use this way.
+ 
++config ARM_FLUSH_CONSOLE_ON_RESTART
++	bool "Force flush the console on restart"
++	help
++	  If the console is locked while the system is rebooted, the messages
++	  in the temporary logbuffer would not have propogated to all the
++	  console drivers. This option forces the console lock to be
++	  released if it failed to be acquired, which will cause all the
++	  pending messages to be flushed.
++
++config CP_ACCESS
++	tristate "CP register access tool"
++	default m
++	help
++	  Provide support for Coprocessor register access using /sys
++	  interface. Read and write to CP registers from userspace
++	  through sysfs interface. A sys file (cp_rw) will be created under
++	  /sys/devices/system/cpaccess/cpaccess0.
++
++	  If unsure, say N.
++
+ endmenu
+ 
+ menu "Boot options"
+@@ -1705,6 +1809,7 @@
+ 	bool "Flattened Device Tree support"
+ 	select OF
+ 	select OF_EARLY_FLATTREE
++	select IRQ_DOMAIN
+ 	help
+ 	  Include support for flattened device tree machine descriptions.
+ 
+@@ -1753,6 +1858,38 @@
+ 	  which in turn loads the rest the kernel image to RAM using the
+ 	  MMCIF hardware block.
+ 
++config ARM_APPENDED_DTB
++	bool "Use appended device tree blob to zImage (EXPERIMENTAL)"
++	depends on OF && !ZBOOT_ROM && EXPERIMENTAL
++	help
++	  With this option, the boot code will look for a device tree binary
++	  (DTB) appended to zImage
++	  (e.g. cat zImage <filename>.dtb > zImage_w_dtb).
++
++	  This is meant as a backward compatibility convenience for those
++	  systems with a bootloader that can't be upgraded to accommodate
++	  the documented boot protocol using a device tree.
++
++	  Beware that there is very little in terms of protection against
++	  this option being confused by leftover garbage in memory that might
++	  look like a DTB header after a reboot if no actual DTB is appended
++	  to zImage.  Do not leave this option active in a production kernel
++	  if you don't intend to always append a DTB.  Proper passing of the
++	  location into r2 of a bootloader provided DTB is always preferable
++	  to this option.
++
++config ARM_ATAG_DTB_COMPAT
++	bool "Supplement the appended DTB with traditional ATAG information"
++	depends on ARM_APPENDED_DTB
++	help
++	  Some old bootloaders can't be updated to a DTB capable one, yet
++	  they provide ATAGs with memory configuration, the ramdisk address,
++	  the kernel cmdline string, etc.  Such information is dynamically
++	  provided by the bootloader and can't always be stored in a static
++	  DTB.  To allow a device tree enabled kernel to be used with such
++	  bootloaders, this option allows zImage to extract the information
++	  from the ATAG list and store it at run time into the appended DTB.
++
+ config CMDLINE
+ 	string "Default kernel command string"
+ 	default ""
+@@ -1957,6 +2094,14 @@
+ 
+ endmenu
+ 
++config CPU_FREQ_MSM
++        bool
++        depends on CPU_FREQ && ARCH_MSM
++        default y
++        help
++          This enables the CPUFreq driver for Qualcomm CPUs.
++          If in doubt, say Y.
++
+ menu "Floating point emulation"
+ 
+ comment "At least one emulation must be selected"
+@@ -2046,7 +2191,7 @@
+ source "kernel/power/Kconfig"
+ 
+ config ARCH_SUSPEND_POSSIBLE
+-	depends on !ARCH_S5P64X0 && !ARCH_S5PC100
++	depends on !ARCH_S5P64X0 && !ARCH_S5PC100 && !ARCH_FSM9XXX
+ 	depends on CPU_ARM920T || CPU_ARM926T || CPU_SA1100 || \
+ 		CPU_V6 || CPU_V6K || CPU_V7 || CPU_XSC3 || CPU_XSCALE
+ 	def_bool y
+--- arch/arm/Makefile
++++ arch/arm/Makefile
+@@ -255,6 +255,7 @@
+ core-y				+= $(machdirs) $(platdirs)
+ 
+ drivers-$(CONFIG_OPROFILE)      += arch/arm/oprofile/
++core-y				+= arch/arm/perfmon/
+ 
+ libs-y				:= arch/arm/lib/ $(libs-y)
+ 
+--- arch/arm/boot/compressed/.gitignore
++++ arch/arm/boot/compressed/.gitignore
+@@ -5,3 +5,12 @@
+ piggy.lzma
+ vmlinux
+ vmlinux.lds
++
++# borrowed libfdt files
++fdt.c
++fdt.h
++fdt_ro.c
++fdt_rw.c
++fdt_wip.c
++libfdt.h
++libfdt_internal.h
+--- arch/arm/boot/compressed/Makefile
++++ arch/arm/boot/compressed/Makefile
+@@ -20,6 +20,10 @@
+ OBJS	+= misc.o decompress.o
+ FONTC	= $(srctree)/drivers/video/console/font_acorn_8x8.c
+ 
++# string library code (-Os is enforced to keep it much smaller)
++OBJS		+= string.o
++CFLAGS_string.o	:= -Os
++
+ #
+ # Architecture dependencies
+ #
+@@ -83,21 +87,42 @@
+ suffix_$(CONFIG_KERNEL_LZO)  = lzo
+ suffix_$(CONFIG_KERNEL_LZMA) = lzma
+ 
++# Borrowed libfdt files for the ATAG compatibility mode
++
++libfdt		:= fdt_rw.c fdt_ro.c fdt_wip.c fdt.c
++libfdt_hdrs	:= fdt.h libfdt.h libfdt_internal.h
++
++libfdt_objs	:= $(addsuffix .o, $(basename $(libfdt)))
++
++$(addprefix $(obj)/,$(libfdt) $(libfdt_hdrs)): $(obj)/%: $(srctree)/scripts/dtc/libfdt/%
++	$(call cmd,shipped)
++
++$(addprefix $(obj)/,$(libfdt_objs) atags_to_fdt.o): \
++	$(addprefix $(obj)/,$(libfdt_hdrs))
++
++ifeq ($(CONFIG_ARM_ATAG_DTB_COMPAT),y)
++OBJS	+= $(libfdt_objs) atags_to_fdt.o
++endif
++
+ targets       := vmlinux vmlinux.lds \
+ 		 piggy.$(suffix_y) piggy.$(suffix_y).o \
+-		 font.o font.c head.o misc.o $(OBJS)
++		 lib1funcs.o lib1funcs.S font.o font.c head.o misc.o $(OBJS)
+ 
+ # Make sure files are removed during clean
+-extra-y       += piggy.gzip piggy.lzo piggy.lzma lib1funcs.S
++extra-y       += piggy.gzip piggy.lzo piggy.lzma lib1funcs.S $(libfdt) $(libfdt_hdrs)
+ 
+ ifeq ($(CONFIG_FUNCTION_TRACER),y)
+ ORIG_CFLAGS := $(KBUILD_CFLAGS)
+ KBUILD_CFLAGS = $(subst -pg, , $(ORIG_CFLAGS))
+ endif
+ 
+-ccflags-y := -fpic -fno-builtin
++ccflags-y := -fpic -fno-builtin -I$(obj)
+ asflags-y := -Wa,-march=all
+ 
++# Supply kernel BSS size to the decompressor via a linker symbol.
++SIZEBIN := $(if $(shell which $(CROSS_COMPILE)size),$(CROSS_COMPILE)size,size)
++KBSS_SZ = $(shell $(SIZEBIN) $(obj)/../../../../vmlinux | awk 'END{print $$3}')
++LDFLAGS_vmlinux = --defsym _kernel_bss_size=$(KBSS_SZ)
+ # Supply ZRELADDR to the decompressor via a linker symbol.
+ ifneq ($(CONFIG_AUTO_ZRELADDR),y)
+ LDFLAGS_vmlinux += --defsym zreladdr=$(ZRELADDR)
+@@ -117,7 +142,7 @@
+ # For __aeabi_uidivmod
+ lib1funcs = $(obj)/lib1funcs.o
+ 
+-$(obj)/lib1funcs.S: $(srctree)/arch/$(SRCARCH)/lib/lib1funcs.S FORCE
++$(obj)/lib1funcs.S: $(srctree)/arch/$(SRCARCH)/lib/lib1funcs.S
+ 	$(call cmd,shipped)
+ 
+ # We need to prevent any GOTOFF relocs being used with references
+--- arch/arm/boot/compressed/head.S
++++ arch/arm/boot/compressed/head.S
+@@ -27,6 +27,14 @@
+ 		.macro	writeb, ch, rb
+ 		mcr	p14, 0, \ch, c0, c5, 0
+ 		.endm
++#elif defined(CONFIG_CPU_V7)
++		.macro	loadsp, rb, tmp
++		.endm
++		.macro	writeb, ch, rb
++wait:		mrc	p14, 0, pc, c0, c1, 0
++		bcs	wait
++		mcr	p14, 0, \ch, c0, c5, 0
++		.endm
+ #elif defined(CONFIG_CPU_XSCALE)
+ 		.macro	loadsp, rb, tmp
+ 		.endm
+@@ -320,15 +425,14 @@
+  *   r10 = end of this image, including  bss/stack/malloc space if non XIP
+  * We basically want:
+  *   r4 - 16k page directory >= r10 -> OK
+- *   r4 + image length <= current position (pc) -> OK
++ *   r4 + image length <= address of wont_overwrite -> OK
+  */
+ 		add	r10, r10, #16384
+ 		cmp	r4, r10
+ 		bhs	wont_overwrite
+ 		add	r10, r4, r9
+-   ARM(		cmp	r10, pc		)
+- THUMB(		mov	lr, pc		)
+- THUMB(		cmp	r10, lr		)
++		adr	r9, wont_overwrite
++		cmp	r10, r9
+ 		bls	wont_overwrite
+ 
+ /*
+@@ -382,14 +486,16 @@
+  *   r2  = BSS start
+  *   r3  = BSS end
+  *   r4  = kernel execution address
++ *   r5  = appended dtb size (0 if not present)
+  *   r7  = architecture ID
+  *   r8  = atags pointer
+  *   r11 = GOT start
+  *   r12 = GOT end
+  *   sp  = stack pointer
+  */
+-		teq	r0, #0
++		orrs	r1, r0, r5
+ 		beq	not_relocated
++
+ 		add	r11, r11, r0
+ 		add	r12, r12, r0
+ 
+@@ -404,12 +510,21 @@
+ 
+ 		/*
+ 		 * Relocate all entries in the GOT table.
++		 * Bump bss entries to _edata + dtb size
+ 		 */
+ 1:		ldr	r1, [r11, #0]		@ relocate entries in the GOT
+-		add	r1, r1, r0		@ table.  This fixes up the
+-		str	r1, [r11], #4		@ C references.
++		add	r1, r1, r0		@ This fixes up C references
++		cmp	r1, r2			@ if entry >= bss_start &&
++		cmphs	r3, r1			@       bss_end > entry
++		addhi	r1, r1, r5		@    entry += dtb size
++		str	r1, [r11], #4		@ next entry
+ 		cmp	r11, r12
+ 		blo	1b
++
++		/* bump our bss pointers too */
++		add	r2, r2, r5
++		add	r3, r3, r5
++
+ #else
+ 
+ 		/*
+@@ -753,6 +868,8 @@
+ @		b	__arm6_mmu_cache_off
+ @		b	__armv3_mmu_cache_flush
+ 
++#if !defined(CONFIG_CPU_V7)
++		/* This collides with some V7 IDs, preventing correct detection */
+ 		.word	0x00000000		@ old ARM ID
+ 		.word	0x0000f000
+ 		mov	pc, lr
+@@ -761,6 +878,7 @@
+  THUMB(		nop				)
+ 		mov	pc, lr
+  THUMB(		nop				)
++#endif
+ 
+ 		.word	0x41007000		@ ARM7/710
+ 		.word	0xfff8fe00
